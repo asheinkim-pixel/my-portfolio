@@ -607,10 +607,20 @@
             if (!q) return;
             state.searching = true;
             render();
-            state.searchResults = await searchStockAPI(q);
+
+            const results = await searchStockAPI(q);
+            state.searchResults = results;
             state.searching = false;
+
+            // 종목코드(예: 005387, 0064K0)로 검색 시 결과가 1개면 자동 선택
+            if (/^[0-9A-Za-z]{6}$/.test(q) && results && results.length === 1) {
+                selectSearchResult(results[0]);
+                return;
+            }
+
             render();
         }
+
 
         function selectSearchResult(item) {
             state.selectedStock = item;
@@ -926,7 +936,7 @@
                                 </div>
                             ` : `
                                 <div class="search-row">
-                                    <input id="searchInput" class="form-input" placeholder="종목명 (예: 삼성전자)" 
+                                    <input id="searchInput" class="form-input" placeholder="종목명 또는 종목코드 (예: 삼성전자 / 005387 / 0064K0)" 
                                            value="${state.searchQuery}" 
                                            oninput="state.searchQuery=this.value"
                                            onkeydown="if(event.key==='Enter')doSearch()">
