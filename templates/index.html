@@ -498,6 +498,49 @@
 
         .toast.show { opacity: 1; }
 
+        /* ── Share ── */
+        .share-btn {
+            background: rgba(102,187,106,0.12);
+            border: 1px solid rgba(102,187,106,0.25);
+            color: #A5D6A7;
+            padding: 9px 12px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .share-btn:active { transform: scale(0.95); }
+
+        .import-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.9);
+            z-index: 200;
+            align-items: center; justify-content: center;
+            padding: 24px;
+        }
+        .import-overlay.open { display: flex; }
+        .import-box {
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 28px 20px;
+            width: 100%; max-width: 360px;
+            text-align: center;
+            animation: fadeIn 0.2s ease;
+        }
+        .import-icon { font-size: 48px; margin-bottom: 12px; }
+        .import-title { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+        .import-desc { font-size: 13px; color: var(--text2); margin-bottom: 6px; line-height: 1.5; }
+        .import-count { font-size: 15px; font-weight: 700; color: var(--accent); margin-bottom: 18px; }
+        .import-btns { display: flex; gap: 10px; }
+        .import-btns button {
+            flex: 1; padding: 14px 0; border: none;
+            border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer;
+        }
+        .import-skip { background: rgba(255,255,255,0.06); color: #aaa; }
+        .import-replace { background: linear-gradient(135deg, #4D8CFF, #2A5CCC); color: white; }
+
         /* ── Detail Modal ── */
         .detail-bg {
             display: none;
@@ -782,9 +825,12 @@
                             <div class="header-title">💼 내 포트폴리오</div>
                             ${updateStr ? `<div class="header-sub"><span class="dot"></span>${updateStr} 업데이트</div>` : ''}
                         </div>
-                        <button class="refresh-btn ${state.refreshing?'loading':''}" onclick="refreshAll()">
+                        <div style="display:flex;gap:6px">
+                            ${state.stocks.length ? `<button class="share-btn" onclick="encodePortfolio()">📤 공유</button>` : ''}
+                            <button class="refresh-btn ${state.refreshing?'loading':''}" onclick="refreshAll()">
                             ${state.refreshing ? '⏳ 조회중' : '🔄 시세갱신'}
                         </button>
+                        </div>
                     </div>
                     ${state.stocks.length ? `
                     <div class="summary">
@@ -992,6 +1038,26 @@
 
             html += '<div class="toast" id="toast"></div>';
 
+            // Import overlay
+            if (state.showImport && state.importData) {
+                const cnt = state.importData.length;
+                const names = state.importData.slice(0, 3).map(s => s.name).join(', ');
+                const more = cnt > 3 ? ` 외 ${cnt - 3}종목` : '';
+                html += `
+                <div class="import-overlay open" onclick="cancelImport()">
+                    <div class="import-box" onclick="event.stopPropagation()">
+                        <div class="import-icon">📥</div>
+                        <div class="import-title">포트폴리오 가져오기</div>
+                        <div class="import-desc">공유 링크에서 포트폴리오를 발견했습니다</div>
+                        <div class="import-count">${names}${more} (${cnt}종목)</div>
+                        <div class="import-btns">
+                            <button class="import-skip" onclick="cancelImport()">취소</button>
+                            <button class="import-replace" onclick="doImport('replace')">가져오기</button>
+                        </div>
+                    </div>
+                </div>`;
+            }
+
             document.getElementById('app').innerHTML = html;
 
             // Render treemap SVG after DOM update
@@ -1032,8 +1098,87 @@
             svg.innerHTML = svgHTML;
         }
 
+        // ─── Share / Import ───
+        function encodePortfolio() {
+            if (!state.stocks.length) { showToast('공유할 종목이 없습니다'); return; }
+            // 최소 데이터만 추출 (URL 길이 절약)
+            const min = state.stocks.map(s => ({
+                n: s.name, c: s.code, q: s.quantity,
+                b: s.buyPrice, t: s.targetPrice || 0,
+                s: s.sector, m: s.memo || ''
+            }));
+            const json = JSON.stringify(min);
+            const encoded = btoa(unescape(encodeURIComponent(json)));
+            const url = location.origin + location.pathname + '?pf=' + encoded;
+
+            if (navigator.share) {
+                navigator.share({
+                    title: '내 포트폴리오',
+                    text: `포트폴리오 ${state.stocks.length}종목`,
+                    url: url
+                }).catch(() => {});
+            } else if (navigator.clipboard) {
+                navigator.clipboard.writeText(url).then(() => {
+                    showToast('공유 링크 복사 완료!');
+                }).catch(() => {
+                    prompt('아래 링크를 복사하세요:', url);
+                });
+            } else {
+                prompt('아래 링크를 복사하세요:', url);
+            }
+        }
+
+        function checkImportUrl() {
+            const params = new URLSearchParams(location.search);
+            const pf = params.get('pf');
+            if (!pf) return;
+
+            try {
+                const json = decodeURIComponent(escape(atob(pf)));
+                const items = JSON.parse(json);
+                if (!Array.isArray(items) || !items.length) return;
+
+                // URL 정리 (뒤로가기 시 재import 방지)
+                history.replaceState(null, '', location.pathname);
+
+                // import 데이터를 state에 임시 저장
+                state.importData = items.map(i => ({
+                    name: i.n, code: i.c, quantity: i.q,
+                    buyPrice: i.b, targetPrice: i.t || 0,
+                    sector: i.s, memo: i.m || '',
+                    price: 0, change: 0, changeRate: 0,
+                    addedAt: new Date().toISOString(),
+                    lastUpdated: null
+                }));
+                state.showImport = true;
+            } catch(e) {
+                console.error('Import decode error:', e);
+            }
+        }
+
+        function doImport(mode) {
+            if (!state.importData) return;
+            if (mode === 'replace') {
+                state.stocks = state.importData;
+                showToast(`${state.stocks.length}개 종목 가져오기 완료`);
+            }
+            state.importData = null;
+            state.showImport = false;
+            saveStocks();
+            render();
+            // 가져온 후 시세 갱신
+            setTimeout(refreshAll, 500);
+        }
+
+        function cancelImport() {
+            state.importData = null;
+            state.showImport = false;
+            render();
+        }
+
         // ─── Init ───
         loadStocks();
+        checkImportUrl();
         render();
 
         // Register service worker
