@@ -65,6 +65,38 @@ def cleanup_cache(cache, max_size):
             del cache[k]
 
 
+def extract_naver_stock_name(soup):
+    """네이버 종목 상세페이지에서 종목명을 최대한 안정적으로 추출"""
+    # 1) 기존 선택자
+    el = soup.select_one('.wrap_company h2 a')
+    if el and el.text.strip():
+        return el.text.strip()
+    el = soup.select_one('.h_company h2')
+    if el and el.text.strip():
+        return el.text.strip()
+
+    # 2) OG 메타 태그 (페이지 구조가 바뀌어도 비교적 안정적)
+    meta = soup.select_one('meta[property="og:title"]')
+    if meta and meta.get('content'):
+        title = meta['content'].strip()
+        # 예: "현대차2우B : 네이버 금융"
+        if ':' in title:
+            title = title.split(':', 1)[0].strip()
+        if title:
+            return title
+
+    # 3) <title> 태그 fallback
+    if soup.title and soup.title.text:
+        t = soup.title.text.strip()
+        if ':' in t:
+            t = t.split(':', 1)[0].strip()
+        if t:
+            return t
+
+    return None
+
+
+
 def search_stock_naver(query):
     """네이버 금융 종목 검색"""
     try:
@@ -78,26 +110,26 @@ def search_stock_naver(query):
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'
         }
 
-        # 6자리 코드 직접 조회
+
+        # 6자리 코드(숫자/문자 포함) 직접 조회: 검색 페이지 파싱이 깨져도 추가 가능하게
         if len(query) == 6 and query.isalnum():
             try:
                 url = f'https://finance.naver.com/item/main.naver?code={query}'
                 resp = requests.get(url, headers=headers, timeout=5)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                name = None
-                el = soup.select_one('.wrap_company h2 a')
-                if el:
-                    name = el.text.strip()
-                if not name:
-                    el = soup.select_one('.h_company h2')
-                    if el:
-                        name = el.text.strip()
-                if name:
+                if resp.status_code == 200 and resp.text:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    name = extract_naver_stock_name(soup)
+
+                    # 이름을 못 뽑아도 최소한 코드로는 등록 가능하게
+                    if not name:
+                        name = query.upper()
+
                     result = [{'name': name, 'code': query.upper()}]
                     search_cache[cache_key] = (time.time(), result)
                     return result
             except Exception:
                 pass
+
 
         # 네이버 검색 페이지
         url = 'https://finance.naver.com/search/searchList.naver'
