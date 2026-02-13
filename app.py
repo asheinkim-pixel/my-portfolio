@@ -1,72 +1,47 @@
 """
-📊 포트폴리오 실시간 시세 서버
-- 네이버 금융 스크래핑 프록시
-- PWA 프론트엔드 서빙
+📊 포트폴리오 실시간 시세 서버 v2
+- 네이버 JSON API 사용 (HTML 스크래핑 제거)
+- 3단계 폴백: polling API → m.stock API → api.stock
 - Render 무료 배포 지원
 """
 
 from flask import Flask, jsonify, request, render_template, send_from_directory
 from flask_cors import CORS
 import requests
-from bs4 import BeautifulSoup
+import json
 import time
 import os
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
-# ─── 종목 코드 (로컬 폴백용) ───
-STOCK_CODES = {
-    '삼성전자': '005930', '삼성전자우': '005935',
-    'SK하이닉스': '000660', 'LG에너지솔루션': '373220',
-    '삼성바이오로직스': '207940', '현대차': '005380', '기아': '000270',
-    'NAVER': '035420', '네이버': '035420', '카카오': '035720',
-    'KB금융': '105560', '신한지주': '055550', '삼성물산': '028260',
-    'POSCO홀딩스': '005490', '포스코홀딩스': '005490',
-    'LG화학': '051910', '삼성SDI': '006400',
-    '현대모비스': '012330', 'LG전자': '066570',
-    'SK이노베이션': '096770', '셀트리온': '068270',
-    '삼성생명': '032830', 'SK텔레콤': '017670',
-    'KT&G': '033780', 'LG생활건강': '051900',
-    '한국전력': '015760', '삼성화재': '000810',
-    'HD현대중공업': '329180', '기업은행': '024110',
-    '우리금융지주': '316140', '하나금융지주': '086790',
-    'SK': '034730', 'LG': '003550',
-    '한화에어로스페이스': '012450', '한국항공우주': '047810',
-    '현대로템': '064350', '두산에너빌리티': '034020',
-    '에코프로비엠': '247540', '알테오젠': '196170',
-    'HLB': '028300', '에코프로': '086520',
-    '크래프톤': '259960', '펄어비스': '263750',
-    '리노공업': '058470', 'SK바이오팜': '326030',
-    'SK스퀘어': '402340', '삼성전기': '009150',
-    '고려아연': '010130', '포스코퓨처엠': '003670',
-    'LS일렉트릭': '010120', '효성중공업': '298040',
-    'KT': '030200', '한화': '000880',
-    # ETF
-    'KODEX 200': '069500', 'KODEX 레버리지': '122630',
-    'KODEX 인버스': '114800', 'TIGER 200': '102110',
-    'TIGER 미국S&P500': '360750', 'TIGER 미국나스닥100': '133690',
-    'KODEX 미국S&P500': '379800',
-}
-
 # ─── 캐시 ───
 price_cache = {}
 search_cache = {}
-PRICE_CACHE_TTL = 15      # 15초
-SEARCH_CACHE_TTL = 300    # 5분
+PRICE_CACHE_TTL = 15
+SEARCH_CACHE_TTL = 300
 MAX_CACHE_SIZE = 500
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Referer': 'https://m.stock.naver.com/',
+    'Accept': 'application/json, text/plain, */*',
+}
 
 
 def cleanup_cache(cache, max_size):
-    """캐시 크기 제한"""
     if len(cache) > max_size:
         sorted_keys = sorted(cache.keys(), key=lambda k: cache[k][0])
         for k in sorted_keys[:len(cache) - max_size // 2]:
             del cache[k]
 
 
-def search_stock_naver(query):
-    """네이버 금융 종목 검색"""
+# ═══════════════════════════════════════
+# 종목 검색 (다단계 폴백)
+# ═══════════════════════════════════════
+
+def search_stock(query):
+    """종목 검색 - 네이버 자동완성 JSON API"""
     try:
         cache_key = f"s_{query}"
         if cache_key in search_cache:
@@ -74,58 +49,57 @@ def search_stock_naver(query):
             if time.time() - ts < SEARCH_CACHE_TTL:
                 return result
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'
-        }
-
-        # 6자리 코드 직접 조회
-        if len(query) == 6 and query.isalnum():
-            try:
-                url = f'https://finance.naver.com/item/main.naver?code={query}'
-                resp = requests.get(url, headers=headers, timeout=5)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                name = None
-                el = soup.select_one('.wrap_company h2 a')
-                if el:
-                    name = el.text.strip()
-                if not name:
-                    el = soup.select_one('.h_company h2')
-                    if el:
-                        name = el.text.strip()
-                if name:
-                    result = [{'name': name, 'code': query.upper()}]
-                    search_cache[cache_key] = (time.time(), result)
-                    return result
-            except Exception:
-                pass
-
-        # 네이버 검색 페이지
-        url = 'https://finance.naver.com/search/searchList.naver'
-        resp = requests.get(url, params={'query': query}, headers=headers, timeout=5)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
         results = []
-        seen = set()
-        for item in soup.select('.tbl_search tbody tr')[:15]:
-            try:
-                a = item.select_one('td a.tltle')
-                if not a:
-                    continue
-                name = a.text.strip()
-                link = a.get('href', '')
-                if 'code=' in link:
-                    code = link.split('code=')[1].split('&')[0]
-                    if len(code) == 6 and code.upper() not in seen:
-                        seen.add(code.upper())
-                        results.append({'name': name, 'code': code.upper()})
-            except Exception:
-                continue
 
-        # 로컬 폴백
+        # ① 네이버 증권 자동완성 API (가장 안정적)
+        try:
+            url = 'https://ac.stock.naver.com/ac'
+            params = {'q': query, 'target': 'stock'}
+            r = requests.get(url, params=params, headers=HEADERS, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get('items', [])
+                for item in items[:10]:
+                    code = item.get('code', '')
+                    name = item.get('name', '')
+                    if code and name:
+                        results.append({'name': name, 'code': code})
+                if results:
+                    print(f"[Search OK - ac.stock] '{query}' → {len(results)} results")
+        except Exception as e:
+            print(f"[Search ① ac.stock] failed: {e}")
+
+        # ② m.stock.naver.com 검색 API
         if not results:
-            for name, code in STOCK_CODES.items():
-                if query.lower() in name.lower():
-                    results.append({'name': name, 'code': code})
+            try:
+                url = f'https://m.stock.naver.com/api/search/all'
+                params = {'query': query}
+                r = requests.get(url, params=params, headers=HEADERS, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    # 응답 구조가 여러 형태일 수 있음
+                    stock_list = (
+                        data.get('stocks', []) or
+                        data.get('result', {}).get('stocks', []) or
+                        data.get('result', {}).get('d', []) or
+                        []
+                    )
+                    for item in stock_list[:10]:
+                        code = item.get('code', item.get('itemCode', item.get('cd', '')))
+                        name = item.get('name', item.get('stockName', item.get('nm', '')))
+                        if code and name:
+                            results.append({'name': name, 'code': code})
+                    if results:
+                        print(f"[Search OK - m.stock] '{query}' → {len(results)} results")
+            except Exception as e:
+                print(f"[Search ② m.stock] failed: {e}")
+
+        # ③ 6자리 종목코드 직접 입력인 경우 → 바로 시세 조회
+        if not results and len(query) == 6 and query.isalnum():
+            price_data = get_stock_price(query)
+            if price_data and price_data.get('name'):
+                results.append({'name': price_data['name'], 'code': query.upper()})
+                print(f"[Search OK - direct code] '{query}' → {price_data['name']}")
 
         search_cache[cache_key] = (time.time(), results)
         cleanup_cache(search_cache, MAX_CACHE_SIZE)
@@ -136,96 +110,155 @@ def search_stock_naver(query):
         return []
 
 
-def get_stock_price(code):
-    """네이버 금융 시세 조회"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'
-        }
-        url = f'https://finance.naver.com/item/main.naver?code={code}'
-        resp = requests.get(url, headers=headers, timeout=5)
-        soup = BeautifulSoup(resp.text, 'html.parser')
+# ═══════════════════════════════════════
+# 주가 조회 (다단계 폴백)
+# ═══════════════════════════════════════
 
-        # 현재가
-        price = None
-        el = soup.select_one('.no_today .blind')
-        if el:
-            price = int(el.text.replace(',', '').strip())
-        if not price:
-            el = soup.select_one('.rate_info .blind')
-            if el:
-                price = int(el.text.replace(',', '').strip())
-        if not price:
+def parse_polling_response(text, code):
+    """polling API 응답 파싱 (JSON-like but not strict JSON)"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            cleaned = text.replace("null", "None").replace("true", "True").replace("false", "False")
+            data = eval(cleaned)
+        except Exception:
             return None
 
-        # 등락
-        change = 0
-        change_rate = 0.0
-        try:
-            exday = soup.select_one('.no_exday')
-            if exday:
-                # 방향(상승/하락/보합) 판단을 텍스트에 의존하면(상승·하락 단어가 같이 들어가는 경우가 있어)
-                # 잘못 판단될 수 있으므로, 아이콘 class를 우선 사용한다.
-                direction = 0  # +1 상승, -1 하락, 0 보합/알수없음
+    try:
+        areas = data.get('result', {}).get('areas', [])
+        if not areas:
+            return None
+        datas = areas[0].get('datas', [])
+        if not datas:
+            return None
 
-                ico = (exday.select_one('.ico') or exday.select_one('em.ico') or exday.select_one('span.ico'))
-                if ico:
-                    classes = ' '.join(ico.get('class', [])).lower()
-                    if 'up' in classes:
-                        direction = +1
-                    elif 'down' in classes:
-                        direction = -1
+        d = datas[0]
+        price = int(d.get('nv', 0))
+        if price <= 0:
+            return None
 
-                # 아이콘으로 못 잡으면 텍스트(상승/하락)로 보조 판단
-                text_all = exday.get_text(' ', strip=True)
-                if direction == 0:
-                    up_i = text_all.find('상승')
-                    dn_i = text_all.find('하락')
-                    if up_i != -1 and (dn_i == -1 or up_i < dn_i):
-                        direction = +1
-                    elif dn_i != -1 and (up_i == -1 or dn_i < up_i):
-                        direction = -1
+        change = int(d.get('cv', 0))
+        change_rate = float(d.get('cr', 0))
+        name = d.get('nm', '')
 
-                # 전일대비 값(절댓값)
-                blind = exday.select_one('.blind')
-                if blind:
-                    val = int(blind.text.replace(',', '').strip() or 0)
-                    if direction == +1:
-                        change = abs(val)
-                    elif direction == -1:
-                        change = -abs(val)
-                    else:
-                        change = 0
-
-                # 등락률(절댓값) - blind 두번째가 퍼센트인 경우가 많음
-                blinds = exday.select('.blind')
-                if len(blinds) >= 2:
-                    r = blinds[1].text.replace('%', '').replace('+', '').replace('-', '').strip()
-                    if r:
-                        change_rate = float(r)
-                        if direction == -1:
-                            change_rate = -abs(change_rate)
-                        elif direction == +1:
-                            change_rate = abs(change_rate)
-        except Exception:
-            pass
+        # sv: 부호 (1=상승, 2=하락, 3=보합, 4=상한, 5=하한)
+        sign = str(d.get('sv', '3'))
+        if sign in ('2', '5'):
+            change = -abs(change)
+            change_rate = -abs(change_rate)
+        elif sign in ('1', '4'):
+            change = abs(change)
+            change_rate = abs(change_rate)
 
         return {
+            'name': name,
             'price': price,
             'change': change,
             'changeRate': round(change_rate, 2)
         }
-
-    except Exception as e:
-        print(f"Price error for {code}: {e}")
+    except Exception:
         return None
 
 
-# ─── API 엔드포인트 ───
+def parse_mstock_response(data):
+    """m.stock / api.stock 응답 파싱 - 부호 포함"""
+    try:
+        # 현재가
+        price_str = str(
+            data.get('closePrice', '') or
+            data.get('now', '') or
+            data.get('currentPrice', '') or
+            '0'
+        )
+        price = int(price_str.replace(',', '').replace('+', '').replace('-', '').strip())
+        if price <= 0:
+            return None
+
+        # 전일대비 - 원본 문자열의 부호를 그대로 사용
+        change_str = str(
+            data.get('compareToPreviousClosePrice', '') or
+            data.get('change', '') or
+            '0'
+        )
+        change = int(change_str.replace(',', '').strip() or '0')
+
+        # 등락률 - 원본 문자열의 부호를 그대로 사용
+        rate_str = str(
+            data.get('fluctuationsRatio', '') or
+            data.get('changeRate', '') or
+            '0'
+        )
+        change_rate = float(rate_str.replace(',', '').replace('%', '').strip() or '0')
+
+        name = (
+            data.get('stockName', '') or
+            data.get('itemName', '') or
+            data.get('stockNameEng', '') or
+            ''
+        )
+
+        return {
+            'name': name,
+            'price': price,
+            'change': change,
+            'changeRate': round(change_rate, 2)
+        }
+    except Exception as e:
+        print(f"[parse_mstock] error: {e}")
+        return None
+
+
+def get_stock_price(code):
+    """실시간 주가 조회 - m.stock 우선 (가장 정확)"""
+    code = code.upper()
+
+    # ① m.stock.naver.com API (가장 정확, 당일 등락률 신뢰)
+    try:
+        url = f'https://m.stock.naver.com/api/stock/{code}/basic'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            result = parse_mstock_response(r.json())
+            if result:
+                print(f"[Price OK - m.stock] {code}: {result['price']:,}원 ({result['changeRate']:+}%)")
+                return result
+    except Exception as e:
+        print(f"[Price ① m.stock] {code} failed: {e}")
+
+    # ② api.stock.naver.com
+    try:
+        url = f'https://api.stock.naver.com/stock/{code}/basic'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            result = parse_mstock_response(r.json())
+            if result:
+                print(f"[Price OK - api.stock] {code}: {result['price']:,}원 ({result['changeRate']:+}%)")
+                return result
+    except Exception as e:
+        print(f"[Price ② api.stock] {code} failed: {e}")
+
+    # ③ polling.finance.naver.com (폴백 - 캐시 지연 가능성)
+    try:
+        url = f'https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            result = parse_polling_response(r.text, code)
+            if result:
+                print(f"[Price OK - polling] {code}: {result['price']:,}원 ({result['changeRate']:+}%)")
+                return result
+    except Exception as e:
+        print(f"[Price ③ polling] {code} failed: {e}")
+
+    print(f"[Price FAIL] {code}: all methods failed")
+    return None
+
+
+# ═══════════════════════════════════════
+# Flask 라우트
+# ═══════════════════════════════════════
 
 @app.route('/')
 def index():
-    """PWA 메인 페이지"""
     return render_template('index.html')
 
 
@@ -244,14 +277,13 @@ def api_search():
     q = request.args.get('q', '').strip()
     if not q:
         return jsonify([])
-    results = search_stock_naver(q)
+    results = search_stock(q)
     return jsonify(results[:10])
 
 
 @app.route('/api/stock/<code>')
 def api_stock(code):
-    # 캐시
-    cache_key = code
+    cache_key = code.upper()
     if cache_key in price_cache:
         ts, data = price_cache[cache_key]
         if time.time() - ts < PRICE_CACHE_TTL:
@@ -261,7 +293,8 @@ def api_stock(code):
     if data:
         result = {
             'success': True,
-            'code': code,
+            'code': code.upper(),
+            'name': data.get('name', ''),
             'price': data['price'],
             'priceStr': f"{data['price']:,}",
             'change': data['change'],
@@ -275,11 +308,11 @@ def api_stock(code):
 
 @app.route('/api/batch', methods=['POST'])
 def api_batch():
-    """여러 종목 일괄 조회 (모바일 최적화)"""
+    """여러 종목 일괄 조회"""
     codes = request.json.get('codes', [])
     results = []
-    for code in codes[:20]:  # 최대 20개
-        cache_key = code
+    for code in codes[:20]:
+        cache_key = code.upper()
         if cache_key in price_cache:
             ts, data = price_cache[cache_key]
             if time.time() - ts < PRICE_CACHE_TTL:
@@ -290,7 +323,8 @@ def api_batch():
         if data:
             result = {
                 'success': True,
-                'code': code,
+                'code': code.upper(),
+                'name': data.get('name', ''),
                 'price': data['price'],
                 'priceStr': f"{data['price']:,}",
                 'change': data['change'],
@@ -298,19 +332,78 @@ def api_batch():
             }
             price_cache[cache_key] = (time.time(), result)
             results.append(result)
-            time.sleep(0.3)  # 네이버 차단 방지
+            time.sleep(0.2)
 
     cleanup_cache(price_cache, MAX_CACHE_SIZE)
     return jsonify({'success': True, 'results': results})
 
 
+@app.route('/api/debug/<code>')
+def api_debug(code):
+    """디버그: 각 API별 응답 + 파싱 결과 확인"""
+    debug = {}
+
+    # m.stock (최우선)
+    try:
+        url = f'https://m.stock.naver.com/api/stock/{code}/basic'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        raw = r.json() if r.status_code == 200 else {}
+        parsed = parse_mstock_response(raw) if raw else None
+        # 핵심 필드만 추출
+        key_fields = {k: raw.get(k) for k in [
+            'stockName', 'closePrice', 'compareToPreviousClosePrice',
+            'fluctuationsRatio', 'compareToPreviousPrice', 'risefall'
+        ] if k in raw}
+        debug['m_stock'] = {
+            'status': r.status_code,
+            'key_fields': key_fields,
+            'parsed': parsed
+        }
+    except Exception as e:
+        debug['m_stock'] = {'error': str(e)}
+
+    # api.stock
+    try:
+        url = f'https://api.stock.naver.com/stock/{code}/basic'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        raw = r.json() if r.status_code == 200 else {}
+        parsed = parse_mstock_response(raw) if raw else None
+        key_fields = {k: raw.get(k) for k in [
+            'stockName', 'closePrice', 'compareToPreviousClosePrice',
+            'fluctuationsRatio', 'compareToPreviousPrice', 'risefall'
+        ] if k in raw}
+        debug['api_stock'] = {
+            'status': r.status_code,
+            'key_fields': key_fields,
+            'parsed': parsed
+        }
+    except Exception as e:
+        debug['api_stock'] = {'error': str(e)}
+
+    # polling
+    try:
+        url = f'https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{code}'
+        r = requests.get(url, headers=HEADERS, timeout=5)
+        parsed = parse_polling_response(r.text, code) if r.status_code == 200 else None
+        debug['polling'] = {
+            'status': r.status_code,
+            'body_preview': r.text[:300] if r.status_code == 200 else '',
+            'parsed': parsed
+        }
+    except Exception as e:
+        debug['polling'] = {'error': str(e)}
+
+    return jsonify(debug)
+
+
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'version': 'v2-json-api'})
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_ENV') == 'development'
-    print(f"🚀 서버 시작: http://localhost:{port}")
+    print(f"🚀 서버 v2 시작: http://localhost:{port}")
+    print(f"   디버그: /api/debug/005930")
     app.run(host='0.0.0.0', port=port, debug=debug)
